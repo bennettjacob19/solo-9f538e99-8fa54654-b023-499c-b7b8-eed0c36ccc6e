@@ -74,6 +74,15 @@ def test_timeout_must_be_positive():
         BuildCreate(name="n", steps=[_step("a", timeout=0)])
 
 
+def test_step_id_path_unsafe_rejected():
+    # 步骤 id 会拼进日志文件路径，分隔符与 . / .. 一律拒绝
+    for bad in ("a/b", "a\\b", ".", ".."):
+        with pytest.raises(ValidationError):
+            BuildCreate(name="n", steps=[_step(bad)])
+    ok = BuildCreate(name="n", steps=[_step("compile-step.1")])
+    assert ok.steps[0].id == "compile-step.1"
+
+
 def test_starttime_identity_guard():
     my_pid = os.getpid()
     start = read_starttime(my_pid)

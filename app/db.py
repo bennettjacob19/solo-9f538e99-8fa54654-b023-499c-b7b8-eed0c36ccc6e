@@ -1,8 +1,23 @@
-"""SQLite 持久化层（aiosqlite，单连接 + WAL）。"""
+"""SQLite 持久化层（aiosqlite，单连接 + WAL + 异步互斥锁）。
+
+两个设计要点共同保证构建登记的原子性与查询一致性：
+
+1. 登记事务互斥：``create_build_with_steps`` 在 ``self._lock`` 保护下用
+   ``BEGIN IMMEDIATE ... COMMIT`` 把 build 与全部 steps 一次性落库。
+   持锁期间，任何查询/状态更新都无法插入事务中间 —— 未落定的构建对外
+   不可见；登记失败或进程崩溃，事务整体回滚，不留缺步的可见构建。
+
+2. 复合操作串行化：每个查询的 execute→fetch→close 在锁内原子完成。
+   否则并发协程会在某查询的 fetch 与 close 之间插入新语句，而旧语句的
+   读事务尚未结束，新语句会"加入"该读事务、读到旧快照（stale read）。
+   游标即取即闭，让读事务在锁释放前确定结束，不依赖 GC 时机。
+"""
 from __future__ import annotations
 
-import json
-from typing import Any, Optional
+import asyncio
+import contextlib
+import shutil
+from typing import Any, Iterable, Optional
 
 import aiosqlite
 
@@ -41,9 +56,15 @@ CREATE TABLE IF NOT EXISTS steps (
 """
 
 
+# 登记用步骤记录：(step_uid, command, depends_on_json, timeout_seconds)
+StepSpec = tuple[str, str, str, float]
+
+
 class Database:
     def __init__(self) -> None:
         self._conn: Optional[aiosqlite.Connection] = None
+        # 复合操作互斥锁：登记事务与每条查询都完整持锁，防止交错
+        self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
         config.ensure_dirs()
@@ -59,57 +80,94 @@ class Database:
 
     async def close(self) -> None:
         if self._conn is not None:
-            await self._conn.close()
+            with contextlib.suppress(Exception):
+                await self._conn.close()
             self._conn = None
 
-    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+    # ---- 基础操作（加锁版本供外部调用；下划线版本假定调用方已持锁） -------
+
+    async def _exec(self, sql: str, params: tuple[Any, ...] = ()) -> int:
         assert self._conn is not None
         cur = await self._conn.execute(sql, params)
-        return cur.lastrowid
+        try:
+            return cur.lastrowid
+        finally:
+            await cur.close()
+
+    async def _one(self, sql: str, params: tuple[Any, ...] = ()) -> Optional[aiosqlite.Row]:
+        assert self._conn is not None
+        cur = await self._conn.execute(sql, params)
+        try:
+            return await cur.fetchone()
+        finally:
+            # 必须关闭游标：未走到 SQLITE_DONE 的 SELECT 会让读事务挂起，
+            # 之后的语句会加入该读事务而读到旧快照
+            await cur.close()
+
+    async def _all(self, sql: str, params: tuple[Any, ...] = ()) -> list[aiosqlite.Row]:
+        assert self._conn is not None
+        cur = await self._conn.execute(sql, params)
+        try:
+            return list(await cur.fetchall())
+        finally:
+            await cur.close()
+
+    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        async with self._lock:
+            return await self._exec(sql, params)
 
     async def one(self, sql: str, params: tuple[Any, ...] = ()) -> Optional[aiosqlite.Row]:
-        assert self._conn is not None
-        cur = await self._conn.execute(sql, params)
-        return await cur.fetchone()
+        async with self._lock:
+            return await self._one(sql, params)
 
     async def all(self, sql: str, params: tuple[Any, ...] = ()) -> list[aiosqlite.Row]:
-        assert self._conn is not None
-        cur = await self._conn.execute(sql, params)
-        return list(await cur.fetchall())
+        async with self._lock:
+            return await self._all(sql, params)
 
     # ---- 业务封装 -------------------------------------------------------
 
-    async def create_build(self, name: str, now: str) -> int:
-        return await self.execute(
-            "INSERT INTO builds (name, status, created_at) VALUES (?, 'pending', ?)",
-            (name, now),
-        )
+    async def create_build_with_steps(
+        self, name: str, now: str, steps: Iterable[StepSpec]
+    ) -> int:
+        """原子登记：build 行与全部 step 行在同一事务落库。
 
-    async def create_step(
-        self,
-        build_id: int,
-        step_uid: str,
-        command: str,
-        depends_on: list[str],
-        timeout_seconds: float,
-        log_path: str,
-    ) -> None:
-        await self.execute(
-            """
-            INSERT INTO steps
-                (build_id, step_uid, command, depends_on, timeout_seconds,
-                 status, log_path)
-            VALUES (?, ?, ?, ?, ?, 'pending', ?)
-            """,
-            (
-                build_id,
-                step_uid,
-                command,
-                json.dumps(depends_on),
-                timeout_seconds,
-                log_path,
-            ),
-        )
+        整个事务持锁进行：落定前查询接口看不到该构建（查询在锁外等待，
+        只能读到落定前或落定后的完整状态），调度器也不会被启动；
+        任一步失败（含日志目录/文件创建失败）即整体回滚，并清理已创建的
+        日志目录，不留缺步构建或文件系统残留。进程在事务进行中崩溃时，
+        SQLite 会在下次打开时自动回滚未提交事务，效果相同。
+        """
+        specs = list(steps)
+        build_id: Optional[int] = None
+        async with self._lock:
+            await self._exec("BEGIN IMMEDIATE")
+            try:
+                build_id = await self._exec(
+                    "INSERT INTO builds (name, status, created_at) VALUES (?, 'pending', ?)",
+                    (name, now),
+                )
+                log_dir = config.LOG_ROOT / str(build_id)
+                log_dir.mkdir(parents=True, exist_ok=True)
+                for step_uid, command, depends_on, timeout in specs:
+                    log_path = log_dir / f"{step_uid}.log"
+                    log_path.touch()
+                    await self._exec(
+                        """
+                        INSERT INTO steps
+                            (build_id, step_uid, command, depends_on, timeout_seconds,
+                             status, log_path)
+                        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                        """,
+                        (build_id, step_uid, command, depends_on, timeout, str(log_path)),
+                    )
+                await self._exec("COMMIT")
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await self._exec("ROLLBACK")
+                if build_id is not None:
+                    shutil.rmtree(config.LOG_ROOT / str(build_id), ignore_errors=True)
+                raise
+        return build_id
 
     async def get_build(self, build_id: int) -> Optional[aiosqlite.Row]:
         return await self.one("SELECT * FROM builds WHERE id=?", (build_id,))
@@ -118,6 +176,10 @@ class Database:
         return await self.all(
             "SELECT * FROM builds ORDER BY id DESC LIMIT ?", (limit,)
         )
+
+    async def list_all_build_ids(self) -> set[int]:
+        rows = await self.all("SELECT id FROM builds")
+        return {row["id"] for row in rows}
 
     async def get_steps(self, build_id: int) -> list[aiosqlite.Row]:
         return await self.all(

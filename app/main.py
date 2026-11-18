@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -89,6 +90,10 @@ async def create_build(payload: BuildCreate) -> BuildOut:
         build_id = await scheduler.submit(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        # 登记失败已整体回滚，不会留下缺步构建；以受控 500 告知提交方
+        logging.getLogger("pipeline").exception("构建登记失败: %s", exc)
+        raise HTTPException(status_code=500, detail=f"构建登记失败: {exc}") from exc
     return await _build_out(build_id)
 
 

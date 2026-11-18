@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -38,20 +39,13 @@ class Scheduler:
 
     async def submit(self, payload: BuildCreate) -> int:
         validate_dag(payload.steps)  # ValueError 由路由层转 400
-        build_id = await self.db.create_build(payload.name, _now())
-        log_dir = config.LOG_ROOT / str(build_id)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        for step in payload.steps:
-            log_path = log_dir / f"{step.id}.log"
-            log_path.touch()
-            await self.db.create_step(
-                build_id,
-                step.id,
-                step.command,
-                step.depends_on,
-                step.timeout_seconds,
-                str(log_path),
-            )
+        specs = [
+            (step.id, step.command, json.dumps(step.depends_on), step.timeout_seconds)
+            for step in payload.steps
+        ]
+        # 原子登记：整张 DAG 在同一事务落定。落定前查询接口看不到该构建；
+        # 登记失败整体回滚，不留缺步记录。调度任务只在登记完成后创建。
+        build_id = await self.db.create_build_with_steps(payload.name, _now(), specs)
         task = asyncio.create_task(self._run_build(build_id), name=f"build-{build_id}")
         self._build_tasks[build_id] = task
         task.add_done_callback(self._log_task_exception)
@@ -77,11 +71,25 @@ class Scheduler:
 
         旧构建之外的进程（PID 已被复用、starttime 对不上）绝不动。
         恢复期间不恢复调度，未跑步骤一律不再启动。
+        另外清理登记中断留下的孤儿日志目录（其构建事务已回滚，库中无记录）。
         """
-        stale = await self.db.list_nonterminal_builds()
-        if not stale:
-            return {"builds": 0, "killed_groups": 0}
+        known_ids = await self.db.list_all_build_ids()
+        removed_orphan_dirs = await asyncio.to_thread(
+            _remove_orphan_log_dirs, known_ids
+        )
 
+        stale = await self.db.list_nonterminal_builds()
+        killed_groups = 0
+        if stale:
+            killed_groups = await self._recover_stale_builds(stale)
+        return {
+            "builds": len(stale),
+            "killed_groups": killed_groups,
+            "removed_orphan_log_dirs": removed_orphan_dirs,
+        }
+
+    async def _recover_stale_builds(self, stale: list[Any]) -> int:
+        """清理非终态旧构建的残留进程组并统一标记 interrupted，返回清理的组数。"""
         rows = await self.db.list_steps_for_builds(tuple(b["id"] for b in stale))
         grouped: dict[int, list[Any]] = {}
         for row in rows:
@@ -142,7 +150,7 @@ class Scheduler:
                 started=build["started_at"] is None,
                 finished=True,
             )
-        return {"builds": len(stale), "killed_groups": killed_groups}
+        return killed_groups
 
     # ------------------------------------------------------------- 构建主循环
 
@@ -410,3 +418,16 @@ def _safe_getpgid(pid: int) -> Optional[int]:
         return os.getpgid(pid)
     except ProcessLookupError:
         return None
+
+
+def _remove_orphan_log_dirs(known_ids: set[int]) -> int:
+    """删除没有对应构建行的日志目录（登记事务回滚/中断后的文件系统残留）。"""
+    removed = 0
+    root = config.LOG_ROOT
+    if not root.is_dir():
+        return 0
+    for entry in root.iterdir():
+        if entry.is_dir() and entry.name.isdigit() and int(entry.name) not in known_ids:
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+    return removed

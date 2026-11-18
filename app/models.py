@@ -31,6 +31,15 @@ class StepIn(BaseModel):
             raise ValueError("字符串首尾不允许空白字符")
         return v
 
+    @field_validator("id")
+    @classmethod
+    def _id_safe_for_log_path(cls, v: str) -> str:
+        # 步骤 id 会拼进日志文件路径 logs/<build>/<id>.log：
+        # 含路径分隔符会让登记失败，".."/"." 更是路径穿越隐患，直接拒绝
+        if "/" in v or "\\" in v or v in (".", ".."):
+            raise ValueError("步骤 id 不允许包含路径分隔符或为 . / ..")
+        return v
+
     @field_validator("depends_on")
     @classmethod
     def _unique_deps(cls, v: list[str]) -> list[str]:

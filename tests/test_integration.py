@@ -399,3 +399,86 @@ def test_health_and_docs(server):
     assert health["status"] == "ok" and health["max_parallel"] == 2
     assert server.client.get("/docs").status_code == 200
     assert server.client.get("/openapi.json").status_code == 200
+
+
+# ------------------------------------------- 10. 登记失败：不留缺步可见构建
+
+def test_registration_failure_leaves_no_visible_build(tmp_path_factory):
+    data_dir = tmp_path_factory.mktemp("regfail-data")
+    port = _free_port()
+    srv = ServerHarness(data_dir, port)
+    srv.start()
+    try:
+        bid = submit(srv.client, "ok-first", [step("a", "echo hi")])
+        assert wait_build(srv.client, bid)["status"] == "succeeded"
+        next_id = bid + 1
+        # 预置同名文件，令登记事务内 mkdir(logs/<next_id>) 必然失败，
+        # 模拟"编译→打包"提交中第二步登记失败
+        blocker = data_dir / "logs" / str(next_id)
+        blocker.write_text("block")
+        r = srv.client.post("/builds", json={"name": "compile-package", "steps": [
+            step("compile", "echo compiled"),
+            step("package", "echo packed", ["compile"]),
+        ]})
+        assert r.status_code == 500
+        # 查询接口看不到半成品：列表没有它，详情 404
+        ids = [b["id"] for b in srv.client.get("/builds").json()]
+        assert next_id not in ids
+        assert srv.client.get(f"/builds/{next_id}").status_code == 404
+        blocker.unlink()
+    finally:
+        srv.stop()
+
+    # 同数据目录重启：不应出现被标 interrupted 的缺步构建，服务恢复正常
+    srv2 = ServerHarness(data_dir, port)
+    srv2.start()
+    try:
+        health = srv2.client.get("/health").json()
+        assert health["recovery"]["removed_orphan_log_dirs"] == 0  # 回滚已自清
+        ids = [b["id"] for b in srv2.client.get("/builds").json()]
+        assert next_id not in ids
+        new_bid = submit(srv2.client, "after-failure", [step("x", "echo ok")])
+        assert new_bid == next_id  # 事务回滚，自增 id 无空洞
+        assert wait_build(srv2.client, new_bid)["status"] == "succeeded"
+    finally:
+        srv2.stop()
+
+
+# ------------------------------------------- 11. 登记期间并发查询不见半成品
+
+def test_concurrent_queries_never_see_partial_build(tmp_path_factory):
+    import threading
+
+    data_dir = tmp_path_factory.mktemp("concurrent-data")
+    port = _free_port()
+    srv = ServerHarness(data_dir, port)
+    srv.start()
+    try:
+        stop = threading.Event()
+        observations: list[tuple[int, int]] = []
+
+        def poll() -> None:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as c:
+                while not stop.is_set():
+                    try:
+                        for b in c.get("/builds").json():
+                            observations.append((b["id"], len(b["steps"])))
+                    except httpx.HTTPError:
+                        pass
+
+        t = threading.Thread(target=poll, daemon=True)
+        t.start()
+        try:
+            for i in range(5):
+                steps = [step(f"s{j}", "echo hi") for j in range(12)]
+                r = srv.client.post("/builds", json={"name": f"c{i}", "steps": steps})
+                assert r.status_code == 201, r.text
+                assert len(r.json()["steps"]) == 12
+        finally:
+            stop.set()
+            t.join(timeout=5)
+        # 任何时刻观察到的构建都必须步骤完整，不存在"只有编译步"的中间态
+        assert observations, "轮询应至少观察到一次已登记构建"
+        assert all(n == 12 for _, n in observations), observations
+    finally:
+        srv.stop()
