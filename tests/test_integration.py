@@ -376,6 +376,70 @@ def _step_pid(data_dir: Path, build_id: int, step_uid: str) -> int:
 
 # --------------------------------------------------------------- 9. 其他接口
 
+def test_concurrent_submit_and_list_never_shows_partial_builds(server):
+    """并发提交 + 并发查询：任何时刻可见的构建都必须完整（不少步）。
+
+    回归场景：固件工程师提交"编译→打包"，登记未完成时列表/详情不得暴露，
+    登记失败不得留下只有编译步的 pending 构建。
+    """
+    import threading
+
+    expected: dict[int, int] = {}
+    expected_lock = threading.Lock()
+    stop = threading.Event()
+    violations: list[str] = []
+
+    def submit_one(n: int) -> None:
+        # 每线程独立 client，避免跨线程共享连接
+        with httpx.Client(base_url=str(server.client.base_url), timeout=30) as c:
+            r = c.post("/builds", json={"name": f"conc-{n}", "steps": [
+                step("compile", "echo compile-ok"),
+                step("package", "echo pack-ok", ["compile"]),
+            ]})
+            assert r.status_code == 201, r.text
+            body = r.json()
+            assert len(body["steps"]) == 2  # 201 响应本身就必须完整
+            with expected_lock:
+                expected[body["id"]] = 2
+
+    def poll_lists() -> None:
+        while not stop.is_set():
+            r = server.client.get("/builds", params={"limit": 500})
+            assert r.status_code == 200
+            with expected_lock:
+                snapshot = dict(expected)
+            for b in r.json():
+                want = snapshot.get(b["id"])
+                if want is not None and len(b["steps"]) != want:
+                    violations.append(
+                        f"列表暴露缺步构建 id={b['id']} steps={len(b['steps'])}"
+                    )
+            time.sleep(0.01)
+
+    poller = threading.Thread(target=poll_lists)
+    poller.start()
+    try:
+        threads = [threading.Thread(target=submit_one, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+            assert not t.is_alive(), "提交线程超时"
+    finally:
+        stop.set()
+        poller.join(timeout=10)
+
+    assert not violations, violations
+    assert len(expected) == 8
+    # 详情接口抽查：可见构建的步骤数与 DAG 一致
+    for bid in expected:
+        detail = server.client.get(f"/builds/{bid}").json()
+        assert len(detail["steps"]) == 2
+        wait_build(server.client, bid, timeout=30)
+
+
+# --------------------------------------------------------------- 10. 其他接口
+
 def test_404_and_bad_payloads(server):
     assert server.client.get("/builds/999999").status_code == 404
     assert server.client.post("/builds/999999/cancel").status_code == 404

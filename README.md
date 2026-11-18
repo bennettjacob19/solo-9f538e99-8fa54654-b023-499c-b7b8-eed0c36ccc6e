@@ -8,6 +8,7 @@ FastAPI + SQLite 实现的 DAG 构建流水线：接收至多 12 步的 JSON DAG
 | 需求 | 实现 |
 | --- | --- |
 | 至多 12 步 JSON DAG，含命令/依赖/超时 | `POST /builds`，Pydantic 校验 + 重复 id / 悬空依赖 / 自依赖 / 有环检测（400/422） |
+| 构建登记原子性：不缺步、不提前可见 | 整张 DAG（构建行 + 全部步骤行）在**单事务**内落定（asyncio 写锁把登记事务与其他写互斥）；提交前查询接口经 `registering` 状态过滤看不到它，提交后调度才启动；登记失败/服务中断整体回滚，零残留（500 报错） |
 | 挂载工作目录执行真实命令 | 每构建独立目录 `$PIPELINE_DATA_DIR/workdir/<build_id>/`，compose 挂载命名卷 `/data` |
 | 全局最多两步并行 | 单 worker 内 `asyncio.Semaphore(2)`，名额覆盖步骤全生命周期 |
 | 依赖全成功才启动 | 调度器按 DAG 推进，依赖未全部 `succeeded` 不启动 |
@@ -25,6 +26,8 @@ FastAPI + SQLite 实现的 DAG 构建流水线：接收至多 12 步的 JSON DAG
 步骤状态机：`pending → running → cleaning_up → succeeded|failed|cancelled|interrupted`，
 失败后代为 `skipped`。构建终态：全部成功 `succeeded`；有失败 `failed`；
 取消导致的终止 `cancelled`；重启中断 `interrupted`。
+构建另有内部状态 `registering`（登记事务进行中），它只存在于未提交事务内，
+查询接口、调度与重启恢复一律不可见，启动时若发现残骸（理论上不可能）直接清除。
 
 ## 快速启动（Docker Compose）
 
@@ -84,6 +87,19 @@ curl -s -X POST localhost:8000/builds/1/cancel
 | GET | `/health` | 健康检查与最近一次启动恢复报告 |
 | GET | `/docs` | Swagger UI |
 
+## 构建登记的原子性设计
+
+1. 登记 = 纯数据库单事务：`BEGIN IMMEDIATE` → 插入构建行（`registering`）
+   → 插入全部步骤行 → 同事务内把构建翻转为 `pending` → `COMMIT`。
+   全程持有 asyncio 写锁，调度器等其他协程的写操作在锁外等待，
+   不会混入登记事务、随回滚一起丢失。
+2. 事务提交前：同连接的并发查询（列表/详情/日志/取消）经 `registering`
+   状态过滤，看不到该构建；调度任务也尚未创建，任何步骤都不会被启动。
+3. 任一步骤登记失败（如"编译→打包"的打包步）或服务中途崩溃：
+   事务整体回滚，数据库零残留，API 返回 500；重启恢复不会留下
+   缺步的"中断构建"。已有卷里的完整构建不受影响，可继续查询。
+4. 日志目录在登记提交后由调度器创建，登记阶段不碰文件系统。
+
 ## 进程组与重启恢复的关键设计
 
 1. 每个步骤由 `/bin/sh -c <command>` 在新会话中启动，主命令为进程组组长；
@@ -104,9 +120,11 @@ curl -s -X POST localhost:8000/builds/1/cancel
 ```
 
 - `tests/test_validation.py`：DAG 校验、12 步上限、超时正数、进程身份识别。
+- `tests/test_registration.py`：登记原子性 —— 登记进行中并发查询不可见、
+  第二步登记失败零残留且重启不误判中断、registering 残骸防御清理、并发登记各自完整。
 - `tests/test_integration.py`：以真实 uvicorn 子进程端到端验证成功、失败跳过、
   慢子进程清理判失败、超时、并行上限 2、整次取消、重复取消幂等、慢清理不占
-  另一名额、重启恢复（含不误杀后来构建）、错误请求与文档接口。
+  另一名额、重启恢复（含不误杀后来构建）、并发提交+查询不缺步、错误请求与文档接口。
 
 ## 配置（环境变量）
 

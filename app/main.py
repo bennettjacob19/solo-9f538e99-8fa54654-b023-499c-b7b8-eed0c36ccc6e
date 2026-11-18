@@ -89,6 +89,11 @@ async def create_build(payload: BuildCreate) -> BuildOut:
         build_id = await scheduler.submit(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        # 登记是单事务：此处报错时数据库已整体回滚，不留缺步构建
+        raise HTTPException(
+            status_code=500, detail=f"构建登记失败，未留下任何记录: {exc}"
+        ) from exc
     return await _build_out(build_id)
 
 
@@ -124,6 +129,9 @@ async def get_step_log(
     step_id: str,
     tail: int = Query(0, ge=0, description="只返回最后 N 行，0 表示返回全部（受字节上限约束）"),
 ) -> LogOut:
+    # 先校验构建本身可见：登记中（未提交）的构建及其步骤一律 404
+    if await db.get_build(build_id) is None:
+        raise HTTPException(status_code=404, detail="构建不存在")
     step = await db.get_step(build_id, step_id)
     if step is None:
         raise HTTPException(status_code=404, detail="构建或步骤不存在")

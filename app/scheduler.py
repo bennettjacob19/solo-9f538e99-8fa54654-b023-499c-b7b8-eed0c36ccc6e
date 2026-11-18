@@ -37,21 +37,19 @@ class Scheduler:
     # ------------------------------------------------------------------ API
 
     async def submit(self, payload: BuildCreate) -> int:
+        """登记整张 DAG 并启动调度。
+
+        登记是单事务（见 ``Database.create_build_with_steps``）：
+        任一步骤登记失败或服务中断都不留缺步构建；事务提交前查询接口
+        看不到该构建，调度任务也只在提交成功后才创建。
+        """
         validate_dag(payload.steps)  # ValueError 由路由层转 400
-        build_id = await self.db.create_build(payload.name, _now())
-        log_dir = config.LOG_ROOT / str(build_id)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        for step in payload.steps:
-            log_path = log_dir / f"{step.id}.log"
-            log_path.touch()
-            await self.db.create_step(
-                build_id,
-                step.id,
-                step.command,
-                step.depends_on,
-                step.timeout_seconds,
-                str(log_path),
-            )
+        build_id = await self.db.create_build_with_steps(
+            payload.name,
+            _now(),
+            payload.steps,
+            lambda bid, uid: str(config.LOG_ROOT / str(bid) / f"{uid}.log"),
+        )
         task = asyncio.create_task(self._run_build(build_id), name=f"build-{build_id}")
         self._build_tasks[build_id] = task
         task.add_done_callback(self._log_task_exception)
@@ -77,10 +75,13 @@ class Scheduler:
 
         旧构建之外的进程（PID 已被复用、starttime 对不上）绝不动。
         恢复期间不恢复调度，未跑步骤一律不再启动。
+        登记未完成的构建残骸（registering）不属于"旧构建"，直接删除，
+        绝不让缺步构建变得可见或被当作中断构建。
         """
+        purged = await self.db.purge_registering_builds()
         stale = await self.db.list_nonterminal_builds()
         if not stale:
-            return {"builds": 0, "killed_groups": 0}
+            return {"builds": 0, "killed_groups": 0, "purged_registering": purged}
 
         rows = await self.db.list_steps_for_builds(tuple(b["id"] for b in stale))
         grouped: dict[int, list[Any]] = {}
@@ -142,7 +143,8 @@ class Scheduler:
                 started=build["started_at"] is None,
                 finished=True,
             )
-        return {"builds": len(stale), "killed_groups": killed_groups}
+        return {"builds": len(stale), "killed_groups": killed_groups,
+                "purged_registering": purged}
 
     # ------------------------------------------------------------- 构建主循环
 
@@ -152,6 +154,20 @@ class Scheduler:
         # (步骤 uid, 步骤任务) 成对保存，避免用任务名反解 uid
         step_tasks: list[tuple[str, asyncio.Task[str]]] = []
         try:
+            # 日志目录在调度启动时创建（登记阶段不碰文件系统，保证登记即纯事务）；
+            # 目录都建不出来时构建无法执行，直接落 failed 终态而不是卡 pending
+            log_dir = config.LOG_ROOT / str(build_id)
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                await self.db.set_build_status(
+                    build_id,
+                    "failed",
+                    _now(),
+                    detail=f"日志目录创建失败: {exc}",
+                    finished=True,
+                )
+                return
             await self.db.set_build_status(
                 build_id, "running", _now(), started=True
             )
@@ -388,7 +404,10 @@ class Scheduler:
     @staticmethod
     def _append_log(log_path: str, lines: list[str]) -> None:
         try:
-            with open(log_path, "a", encoding="utf-8") as fh:
+            path = Path(log_path)
+            # 父目录可能尚不存在（登记完成但调度未启动即重启，恢复时补写日志）
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
                 fh.write("\n".join(lines) + "\n")
         except OSError:
             pass

@@ -13,6 +13,11 @@ from . import config
 STEP_TERMINAL = {"succeeded", "failed", "skipped", "cancelled", "interrupted"}
 BUILD_TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
 
+# 构建的登记中状态：构建行已插入，但整张 DAG 尚未在同一事务内落定。
+# 登记事务提交前会在事务内把它翻转为 pending，因此已提交的数据里不应出现它；
+# 查询接口与重启恢复一律将其排除（启动时另有防御性清理兜底）。
+REGISTERING_STATUS = "registering"
+
 # 取消/超时后清理时采用的终态
 CANCEL_TERMINAL = "cancelled"
 TIMEOUT_TERMINAL = "failed"
